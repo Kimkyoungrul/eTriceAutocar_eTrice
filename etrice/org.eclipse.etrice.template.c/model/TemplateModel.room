@@ -1,0 +1,717 @@
+/* 
+ * Shortkeys:
+ *	Ctrl+Space	- content assist
+ * 	F3			- open declaration of selected element
+ *	Alt+S 		- open structure diagram
+ *  Alt+B 		- open behavior diagram
+ *  Alt+M 		- open textual editor (in diagrams)
+ */
+RoomModel TemplateModel {
+
+	import room.basic.types.* from "../../org.eclipse.etrice.modellib.c/model/Types.room"
+	import room.basic.service.timing.* from "../../org.eclipse.etrice.modellib.c/model/TimingService.room"
+	import room.basic.types.* from "C:/Users/kyoung/workspace/org.eclipse.etrice.modellib.c/model/Types.room"
+	import room.basic.service.tcp.* from "C:/Users/kyoung/workspace/org.eclipse.etrice.modellib.c/model/TcpService.room"
+
+	LogicalSystem LogSys {
+		SubSystemRef subSystemRef: SubSysClass
+	}
+
+	SubSystemClass SubSysClass {
+		ActorRef topActor: TopActor
+		ActorRef timingService: ATimingService
+		LayerConnection ref topActor satisfied_by timingService.timer
+		LogicalThread defaultThread
+	}
+
+	// - build your application from here
+	ActorClass TopActor {
+		Structure {
+			ActorRef TCPClient: ATcpClient
+			ActorRef gateway: Gateway
+
+			ActorRef controller: ADAS_Controller
+
+			ActorRef AutoEmergencyBraking: AEB
+			ActorRef AdaptiveCruiseControl: ACC
+			ActorRef AutoLaneKeeping: ALK
+
+			Binding gateway.ctrl and TCPClient.controlPort
+			Binding gateway.payload and TCPClient.payloadPort
+
+			Binding gateway.dataPortA and controller.dataPortB
+
+			Binding AdaptiveCruiseControl.recvPort and controller.relayPortA
+			Binding AutoLaneKeeping.recvPort and controller.relayPortB
+			Binding AutoEmergencyBraking.recvPort and controller.relayPortC
+		}
+	}
+
+	ActorClass Gateway {
+		Interface {
+			conjugated Port ctrl: PTcpControl
+			conjugated Port payload: PTcpPayload
+
+			conjugated Port dataPortA: PSendData
+		}
+		Structure {
+			external Port ctrl
+			external Port payload
+
+			external Port dataPortA
+
+			Attribute str1 [40]: char
+			Attribute str2 [40]: char
+			Attribute situation_code: char
+			Attribute temp_string [40]: char
+		}
+		Behavior {
+			Operation sendPayloadString(data: char ref) {
+				"DTcpPayload package;"
+				"DTcpPayload_setAsString(&package, data);"
+				"payload.dataPackage(&package);"
+			}
+			StateMachine {
+				State Connecting {
+					entry '''
+						printf("Gateway: connecting to port %d\n", 6666);
+						DTcpControl config = {"localhost", 6666};
+						ctrl.connect(&config);'''
+				}
+				State Connected {
+					entry '''
+						// 2. client -> server
+						// when it first send usless data
+						// 5. client -> server(changed data by ADAS)
+						sendPayloadString(str1);'''
+				}
+				State ADAScontroller {
+					entry '''
+						// 3. gateway -> Controller
+						DDataBuffer buf;
+						strcpy(buf.buffer, str2);
+						dataPortA.sendData(&buf);
+					'''
+				}
+				Transition init: initial -> Connecting
+				Transition tr0: Connecting -> Connected {
+					triggers {
+						<connected: ctrl>
+					}
+				}
+				Transition tr1: Connected -> ADAScontroller {
+					triggers {
+						<dataPackage: payload>
+					}
+					action '''
+						// 1. server -> ROOM(gateway)
+						// 1. server -> ROOM(gateway) RingControl
+						printf("\n");
+						strcpy(str2, data->data);
+						printf("inside the gateway(from server): %s\n", str2);
+					'''
+				}
+				Transition tr2: ADAScontroller -> Connected {
+					triggers {
+						<receivedData: dataPortA>
+					}
+					action '''
+						// 4. Controller -> Gateway
+						strcpy(str1, data->buffer);
+						printf("inside the gateway(from controller) str: %s\n", str1);
+						
+						if(isalpha(str1[6]))
+							situation_code = str1[6];
+						else
+							situation_code = str1[7];
+						'''
+				}
+			}
+		}
+	}
+
+	ActorClass ADAS_Controller {
+		Interface {
+			Port dataPortB: PSendData
+
+			conjugated Port relayPortA: PSendData
+			conjugated Port relayPortB: PSendData
+			conjugated Port relayPortC: PSendData
+		}
+		Structure {
+			external Port dataPortB
+
+			external Port relayPortA
+			external Port relayPortB
+			external Port relayPortC
+
+			Attribute str [40]: char
+			Attribute retain_str [40]: char
+			Attribute send_str [40]: char
+
+			Attribute temp_string: string
+
+			Attribute velocity: float32
+			Attribute distance: float32
+			Attribute colliderNum: int32
+			Attribute steering: float32
+			Attribute trafficLight: float32
+		}
+		Behavior {
+			Operation ChoicePoint0(dist: float32, velo: float32, tl: float32, cnum: int32): int32 {
+				// to decide the situation code
+				"if(cnum == 1){"
+				"\t if(dist < 18.0 && velo == 0.0)"
+				"\t\t return 3;" // Lanechange
+				"\t else if(dist <= 210 || velo >= 60)"
+				"\t\t return 2;" // NormalStop
+				"\t else"
+				"\t\t return 4;" // Go
+				"}"
+				"else if(cnum == 2){"
+				"\t if(dist < 10.0 && velo == 0.0)"
+				"\t\t return 3;" // Lanechange
+				"\t else if(dist <= 10)"
+				"\t\t return 1;" // EmergencyStop
+				"\t else if(velo >= 60)"
+				"\t\t return 2;" // NormalStop
+				"\t else"
+				"\t\t return 4;" // Go
+				"}"
+				"else{"
+				"\t if(dist <= 10 && tl > 0)"
+				"\t\t return 1;" // EmergencyStop
+				"\t else if((dist <= 130 && tl > 0) || velo >= 60)"
+				"\t\t return 2;" // NormalStop
+				"\t else"
+				"\t\t return 4;" // Go
+				"}"
+			}
+			Operation ACC() {
+				// when ADAS decide the situation is related with ACC
+				"DDataBuffer buf;"
+				"strcpy(buf.buffer, retain_str);"
+				"relayPortA.sendData(&buf);"
+				"relayPortA.forRingControl();"
+			}
+			Operation ALK() {
+				// when ADAS decide the situation is related with ALK
+				"DDataBuffer buf;"
+				"strcpy(buf.buffer, retain_str);"
+				"relayPortB.sendData(&buf);"
+				"relayPortB.forRingControl();"
+			}
+			Operation AEB() {
+				// when ADAS decide the situation is related with AEB
+				"DDataBuffer buf;"
+				"strcpy(buf.buffer, retain_str);"
+				"relayPortC.sendData(&buf);"
+				"relayPortC.forRingControl();"
+			}
+			StateMachine {
+				State waitingData
+				State EmergencyStop {
+					entry '''
+						ACC();
+						ALK();
+						AEB();'''
+				}
+				State NormalStop {
+					entry '''
+						ACC();
+						ALK();
+						AEB();'''
+				}
+				State LaneChange {
+					entry '''
+						ACC();
+						ALK();
+						AEB();'''
+				}
+				State Go {
+					entry '''
+						ACC();
+						ALK();
+						AEB();'''
+				}
+				ChoicePoint cp0
+				Transition init0: initial -> waitingData
+				Transition tr0: waitingData -> cp cp0 {
+					triggers {
+						<sendData: dataPortB>
+					}
+					action '''
+						strcpy(str, data->buffer);
+						printf("inside the ADAScontroller(from gateway) str: %s\n", str);
+						strcpy(retain_str, str);
+						
+						temp_string = strtok(str, ",");
+						velocity = (200*atof(temp_string))/200;
+						printf("velocity: %.2f\n", velocity);
+						
+						temp_string = strtok(NULL, ",");
+						distance = atof(temp_string);
+						printf("distance: %.2f\n", distance);
+						
+						temp_string = strtok(NULL, ",");
+						colliderNum = atoi(temp_string);
+						printf("colliderNum: %d\n", colliderNum);
+						
+						temp_string = strtok(NULL, ",");
+						steering = atof(temp_string);
+						printf("steering: %.2f\n", steering);
+						
+						temp_string = strtok(NULL, ",");
+						trafficLight = atof(temp_string);
+						printf("tl: %.2f\n", trafficLight);
+						
+					'''
+				}
+				Transition tr1: cp cp0 -> NormalStop {
+					cond '''ChoicePoint0(distance, velocity, trafficLight, colliderNum) == 2'''
+					action '''strcpy(retain_str, strcat(retain_str, ",N"));'''
+				}
+				Transition tr2: cp cp0 -> LaneChange {
+					cond '''ChoicePoint0(distance, velocity, trafficLight, colliderNum) == 3'''
+					action '''strcpy(retain_str, strcat(retain_str, ",L"));'''
+				}
+
+				Transition tr3: cp cp0 -> Go {
+					action '''strcpy(retain_str, strcat(retain_str, ",G"));'''
+				}
+				Transition tr4: cp cp0 -> EmergencyStop {
+					cond '''ChoicePoint0(distance, velocity, trafficLight, colliderNum) == 1'''
+					action '''strcpy(retain_str, strcat(retain_str, ",E"));'''
+				}
+				Transition tr5: NormalStop -> waitingData {
+					triggers {
+						<receivedData: relayPortA>
+					}
+					action '''
+						strcpy(str, data->buffer);
+						strcpy(send_str, str);
+						DDataBuffer buf;
+						strcpy(buf.buffer, send_str);
+						dataPortB.receivedData(&buf);'''
+				}				
+				Transition tr6: Go -> waitingData {
+					triggers {
+						<receivedData: relayPortA>
+					}
+					action '''
+						strcpy(str, data->buffer);
+						strcpy(send_str, str);
+						DDataBuffer buf;
+						strcpy(buf.buffer, send_str);
+						dataPortB.receivedData(&buf);'''
+				}
+				Transition tr7: EmergencyStop -> waitingData {
+					triggers {
+						<receivedData: relayPortC>
+					}
+					action '''
+						strcpy(str, data->buffer);
+						strcpy(send_str, str);
+						DDataBuffer buf;
+						strcpy(buf.buffer, send_str);
+						dataPortB.receivedData(&buf);'''
+				}
+				Transition tr8: LaneChange -> waitingData {
+					triggers {
+						<receivedData: relayPortB>
+					}
+					action '''
+						strcpy(str, data->buffer);
+						strcpy(send_str, str);
+						DDataBuffer buf;
+						strcpy(buf.buffer, send_str);
+						dataPortB.receivedData(&buf);'''
+				}				
+			}
+		}
+	}
+
+	ActorClass ACC {
+		Interface {
+			Port recvPort: PSendData
+		}
+		Structure {
+			usercode1 {
+				"#include <math.h>"
+			}
+			external Port recvPort
+			Attribute str [40]: char
+			Attribute send_str [40]: char
+
+			Attribute temp_string: string
+			Attribute velocity: float32
+			Attribute distance: float32
+			Attribute colliderNum: int32
+			Attribute colliderNum_str [40]: char
+			Attribute steering: float32
+			Attribute trafficLight: float32
+			Attribute situation_code [40]: char
+		}
+		Behavior {
+			Operation ACC_choicePoint0(s_code: charPtr): boolean {
+				"if(strcmp(s_code, \"G\") == 0)"
+				"\t return true;"
+				"else if(strcmp(s_code, \"N\") == 0)"
+				"\t return true;"
+				"else"
+				"\t return false;"
+			}
+			Operation ACC_choicePoint1(dist: float32, velo: float32, tl: float32, cnum: int32): boolean {
+				// true: speed_up, false: speed_down
+				"if(cnum == 1){"
+				"\t if(dist <= 210 || velo >= 60)"
+				"\t\t return false;" // speed_down
+				"\t else"
+				"\t\t return true;" // speed_up
+				"}"
+				"else if(cnum == 2){"
+				"\t if(velo >= 60)"
+				"\t\t return false;" // speed_down
+				"\t else"
+				"\t\t return true;" // speed_up
+				"}"
+				"else{"
+				"\t if((dist <= 130 && tl > 0) || velo >= 60)"
+				"\t\t return false;" // speed_down
+				"\t else"
+				"\t\t return true;" // speed_up
+				"}"
+			}
+			Operation speed_up(dist: float32, velo: float32): int32 {
+				"int32 safe_dist = (velo*velo)/100;"
+				"if(velo == 0 && dist > 20)"
+				"\t return 1;"
+				"else{"
+				"\t if(velo >= 60.0)"
+				"\t\t return 0;"
+				"\t else if(safe_dist < dist && dist > 130)"
+				"\t\t return floor((velo+1)+0.5);"
+				"\t else"
+				"\t\t return 0;"
+				"}"
+			}
+			Operation speed_down(dist: float32, velo: float32): int32 {
+				"int32 safe_dist = (velo*velo)/190;"
+				"if(dist < 135 || velo >= 60.0)"
+				"\t return 0;"
+				"if(safe_dist >= dist){"
+				"\t return 0;"
+				"}"
+				"else"
+				"\t return 0;"
+			}
+			StateMachine {
+				State waitingData
+				State speedUp {
+					entry '''
+						// ACC -> Controller (speed_up)
+						if(speed_up(distance, velocity) < 10)
+							strcpy(send_str, "1");
+						else
+							strcpy(send_str, itoa(speed_up(distance, velocity)/8, send_str, 10));
+							
+						strcpy(send_str, strcat(send_str, ",0,"));
+						strcpy(send_str, strcat(send_str, colliderNum_str));
+						
+						strcpy(send_str, strcat(send_str, ","));
+						strcpy(send_str, strcat(send_str, situation_code));
+						
+						DDataBuffer buf;
+						strcpy(buf.buffer, send_str);
+						recvPort.receivedData(&buf);'''
+				}
+				State speedDown {
+					entry '''
+						// ACC -> Controller (speed_down)
+						strcpy(send_str, itoa(speed_down(distance, velocity), send_str, 10));
+						
+						strcpy(send_str, strcat(send_str, ",0,"));
+						strcpy(send_str, strcat(send_str, colliderNum_str));
+						
+						strcpy(send_str, strcat(send_str, ","));
+						strcpy(send_str, strcat(send_str, situation_code));
+						
+						DDataBuffer buf;
+						strcpy(buf.buffer, send_str);
+						recvPort.receivedData(&buf);'''
+				}
+				ChoicePoint cp0
+				ChoicePoint cp1
+				Transition init0: initial -> waitingData
+				Transition tr0: waitingData -> cp cp0 {
+					triggers {
+						<sendData: recvPort>
+					}
+					action '''
+						// Controller -> ACC
+						strcpy(str, data->buffer);
+						printf("\n");
+						printf("inside the ACC str = %s\n", str);
+						
+						temp_string = strtok(str, ",");
+						velocity = (200*atof(temp_string))/200;
+						printf("velocity: %.2f\n", velocity);
+						
+						temp_string = strtok(NULL, ",");
+						distance = atof(temp_string);
+						printf("distance: %.2f\n", distance);
+						
+						temp_string = strtok(NULL, ",");
+						strcpy(colliderNum_str, temp_string);
+						colliderNum = atoi(temp_string);
+						printf("colliderNum: %d\n", colliderNum);
+						
+						temp_string = strtok(NULL, ",");
+						steering = atof(temp_string);
+						printf("steering: %.2f\n", steering);
+						
+						temp_string = strtok(NULL, ",");
+						trafficLight = atof(temp_string);
+						printf("tl: %.2f\n", trafficLight);
+						
+						temp_string = strtok(NULL, ",");
+						strcpy(situation_code, temp_string);
+						printf("situation_code: %s\n", situation_code);
+						
+					'''
+				}
+				Transition tr1: cp cp0 -> cp cp1 {
+					cond '''ACC_choicePoint0(situation_code)'''
+				}
+				Transition tr2: cp cp0 -> waitingData
+				Transition tr3: cp cp1 -> speedUp {
+					cond '''ACC_choicePoint1(distance, velocity, trafficLight, colliderNum)'''
+				}
+				Transition tr4: cp cp1 -> speedDown
+				Transition tr5: speedUp -> waitingData {
+					triggers {
+						<forRingControl: recvPort>
+					}
+				}
+				Transition tr6: speedDown -> waitingData {
+					triggers {
+						<forRingControl: recvPort>
+					}
+				}
+			}
+		}
+	}
+
+	ActorClass AEB {
+		Interface {
+			Port recvPort: PSendData
+		}
+		Structure {
+			external Port recvPort
+
+			Attribute str [40]: char
+			Attribute send_str [40]: char
+			Attribute temp_string: string
+
+			Attribute velocity: float32
+			Attribute distance: float32
+			Attribute colliderNum: int32
+			Attribute colliderNum_str [40]: char
+			Attribute steering: float32
+			Attribute trafficLight: float32
+			Attribute situation_code [40]: char
+		}
+		Behavior {
+			Operation AEB_choicePoint0(s_code: charPtr): boolean {
+				"if(strcmp(s_code, \"E\") == 0)"
+				"\t return true;"
+				"else"
+				"\t return false;"
+			}
+			Operation emergency_stop(): int32 {
+				"return -1;"
+			}
+			StateMachine {
+				State waitingData
+				State EmergencyStop {
+					entry '''
+						// AEB -> Controller
+						strcpy(send_str, itoa(emergency_stop(), send_str, 10));
+						
+						strcpy(send_str, strcat(send_str, ",0,"));
+						strcpy(send_str, strcat(send_str, colliderNum_str));
+						
+						strcpy(send_str, strcat(send_str, ","));
+						strcpy(send_str, strcat(send_str, situation_code));
+						
+						DDataBuffer buf;
+						strcpy(buf.buffer, send_str);
+						recvPort.receivedData(&buf);'''
+				}
+				ChoicePoint cp0
+				Transition init0: initial -> waitingData
+				Transition tr0: waitingData -> cp cp0 {
+					triggers {
+						<sendData: recvPort>
+					}
+					action '''
+						// Controller -> AEB
+						strcpy(str, data->buffer);
+						printf("\n");
+						printf("inside the AEB str = %s\n", str);
+						
+						temp_string = strtok(str, ",");
+						velocity = (200*atof(temp_string))/200;
+						printf("velocity: %.2f\n", velocity);
+						
+						temp_string = strtok(NULL, ",");
+						distance = atof(temp_string);
+						printf("distance: %.2f\n", distance);
+						
+						temp_string = strtok(NULL, ",");
+						strcpy(colliderNum_str, temp_string);
+						colliderNum = atoi(temp_string);
+						printf("colliderNum: %d\n", colliderNum);
+						
+						temp_string = strtok(NULL, ",");
+						steering = atof(temp_string);
+						printf("steering: %.2f\n", steering);
+						
+						temp_string = strtok(NULL, ",");
+						trafficLight = atof(temp_string);
+						printf("tl: %.2f\n", trafficLight);
+						
+						temp_string = strtok(NULL, ",");
+						strcpy(situation_code, temp_string);
+						printf("situation_code: %s\n", situation_code);'''
+				}
+				Transition tr1: cp cp0 -> EmergencyStop {
+					cond '''AEB_choicePoint0(situation_code)'''
+				}
+				Transition tr2: cp cp0 -> waitingData
+				Transition tr3: EmergencyStop -> waitingData {
+					triggers {
+						<forRingControl: recvPort>
+					}
+				}
+			}
+		}
+	}
+
+	ActorClass ALK {
+		Interface {
+			Port recvPort: PSendData
+		}
+		Structure {
+			external Port recvPort
+
+			Attribute str [40]: char
+			Attribute send_str [40]: char
+			Attribute temp_string: string
+
+			Attribute velocity: float32
+			Attribute distance: float32
+			Attribute colliderNum: int32
+			Attribute colliderNum_str [40]: char
+			Attribute steering: float32
+			Attribute trafficLight: float32
+			Attribute situation_code [40]: char
+		}
+		Behavior {
+			Operation ALKchoicePoint0(s_code: charPtr): boolean {
+				"if(strcmp(s_code, \"L\") == 0)"
+				"\t return true;"
+				"else"
+				"\t return false;"
+			}
+			Operation lane_change(): int32 {
+				"return -2;"
+			}
+			StateMachine {
+				State waitingData
+				State LaneChange {
+					entry '''
+						// ALK -> Controller
+						strcpy(send_str, itoa(lane_change(), send_str, 10));
+						
+						strcpy(send_str, strcat(send_str, ",0,"));
+						strcpy(send_str, strcat(send_str, colliderNum_str));
+						
+						strcpy(send_str, strcat(send_str, ","));
+						strcpy(send_str, strcat(send_str, situation_code));
+						
+						DDataBuffer buf;
+						strcpy(buf.buffer, send_str);
+						recvPort.receivedData(&buf);
+					'''
+				}
+				ChoicePoint cp0
+				Transition init0: initial -> waitingData
+				Transition tr0: waitingData -> cp cp0 {
+					triggers {
+						<sendData: recvPort>
+					}
+					action '''
+						// Controller -> ALK
+						strcpy(str, data->buffer);
+						printf("\n");
+						printf("inside the ALK str = %s\n", str);
+						
+						temp_string = strtok(str, ",");
+						velocity = (200*atof(temp_string))/200;
+						printf("velocity: %.2f\n", velocity);
+						
+						temp_string = strtok(NULL, ",");
+						distance = atof(temp_string);
+						printf("distance: %.2f\n", distance);
+						
+						temp_string = strtok(NULL, ",");
+						strcpy(colliderNum_str, temp_string);
+						colliderNum = atoi(temp_string);
+						printf("colliderNum: %d\n", colliderNum);
+						
+						temp_string = strtok(NULL, ",");
+						steering = atof(temp_string);
+						printf("steering: %.2f\n", steering);
+						
+						temp_string = strtok(NULL, ",");
+						trafficLight = atof(temp_string);
+						printf("tl: %.2f\n", trafficLight);
+						
+						temp_string = strtok(NULL, ",");
+						strcpy(situation_code, temp_string);
+						printf("situation_code: %s\n", situation_code);
+						
+					'''
+				}
+				Transition tr1: cp cp0 -> LaneChange {
+					cond '''ALKchoicePoint0(situation_code)'''
+					action '''
+						colliderNum = colliderNum + 1;
+						strcpy(colliderNum_str, itoa(colliderNum, colliderNum_str, 10));'''
+				}
+				Transition tr2: cp cp0 -> waitingData
+				Transition tr3: LaneChange -> waitingData {
+					triggers {
+						<forRingControl: recvPort>
+					}
+				}
+			}
+		}
+	}
+
+	ProtocolClass PSendData {
+		incoming {
+			Message sendData(data: DDataBuffer)
+			Message forRingControl()
+		}
+		outgoing {
+			Message receivedData(data: DDataBuffer)
+		}
+	}
+
+	DataClass DDataBuffer {
+		// Attribute length: int16
+		Attribute buffer [40]: char
+	}
+}
